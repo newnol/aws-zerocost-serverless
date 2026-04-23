@@ -1,0 +1,722 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Zero-Cost Secure Serverless Task Manager.
+  Serverless-only reference stack for a university architecture diagram:
+  CloudFront + OAC + private S3, API Gateway -> Lambda, Lambda in private VPC,
+  DynamoDB via Gateway VPC Endpoint, CloudWatch, SNS, and AWS Budgets.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: zero-cost-secure-serverless-task-manager
+    AllowedPattern: '^[a-z0-9-]+$'
+    Description: Lowercase project name used in resource names.
+
+  BudgetAlertEmail:
+    Type: String
+    Description: Email address that receives SNS subscription confirmation and budget alerts.
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+
+  BudgetAmountUsd:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Monthly AWS Budget threshold in USD.
+
+  DynamoDbPrefixListId:
+    Type: String
+    Description: >
+      Region-specific AWS-managed prefix list ID for DynamoDB, for example pl-xxxxxxxx.
+      This is used to enforce Lambda egress on TCP 443 only to DynamoDB.
+    AllowedPattern: '^pl-[a-z0-9]+$'
+
+Resources:
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${AWS::AccountId}-${AWS::Region}-frontend'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-frontend'
+
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-oac'
+        Description: OAC for private frontend S3 bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Zero-Cost Secure Serverless Task Manager frontend
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: FrontendS3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig: {}
+            OriginAccessControlId: !GetAtt FrontendOriginAccessControl.Id
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cloudfront'
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadViaOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+
+  AppVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AppVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-a'
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AppVpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-b'
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AppVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-rt'
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Tasks
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: taskId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: taskId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: userId-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-tasks'
+
+  DynamoDbGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      VpcId: !Ref AppVpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowOnlyTasksTableAccess
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:Query
+              - dynamodb:Scan
+            Resource:
+              - !GetAtt TasksTable.Arn
+              - !Sub '${TasksTable.Arn}/index/*'
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda egress only to DynamoDB prefix list on 443
+      VpcId: !Ref AppVpc
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - Description: Allow HTTPS only to DynamoDB prefix list
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !Ref DynamoDbPrefixListId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-sg'
+
+  LambdaTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaTaskRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: task-role-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoDbCrud
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt TasksTable.Arn
+                  - !Sub '${TasksTable.Arn}/index/*'
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Sid: LambdaVpcEni
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:AssignPrivateIpAddresses
+                  - ec2:UnassignPrivateIpAddresses
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: LambdaTaskRole
+
+  LambdaBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaBaseRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: base-role-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Sid: LambdaVpcEni
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:AssignPrivateIpAddresses
+                  - ec2:UnassignPrivateIpAddresses
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: LambdaBaseRole
+
+  TaskApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/TaskApiFunction
+      RetentionInDays: 14
+
+  TaskApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TaskApiFunction
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 10
+      MemorySize: 256
+      Role: !GetAtt LambdaTaskRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TasksTable
+          ALLOWED_ORIGIN: !Sub 'https://${FrontendDistribution.DomainName}'
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          from datetime import datetime, timezone
+
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["TABLE_NAME"])
+          allowed_origin = os.environ["ALLOWED_ORIGIN"]
+
+
+          def response(status_code, body=None):
+              payload = {
+                  "statusCode": status_code,
+                  "headers": {
+                      "Content-Type": "application/json",
+                      "Access-Control-Allow-Origin": allowed_origin,
+                      "Access-Control-Allow-Methods": "OPTIONS,GET,POST,PUT,DELETE",
+                      "Access-Control-Allow-Headers": "Content-Type,Authorization",
+                      "Vary": "Origin",
+                  },
+              }
+              if body is not None:
+                  payload["body"] = json.dumps(body)
+              return payload
+
+
+          def lambda_handler(event, context):
+              method = event.get("httpMethod")
+              path = event.get("resource", event.get("path", ""))
+
+              if method == "OPTIONS":
+                  return response(200)
+
+              try:
+                  if method == "GET" and path == "/tasks":
+                      query = event.get("queryStringParameters") or {}
+                      user_id = query.get("userId", "user123")
+                      result = table.query(
+                          IndexName="userId-index",
+                          KeyConditionExpression=Key("userId").eq(user_id),
+                      )
+                      return response(200, result.get("Items", []))
+
+                  if method == "POST" and path == "/tasks":
+                      body = json.loads(event.get("body") or "{}")
+                      item = {
+                          "taskId": str(uuid.uuid4()),
+                          "userId": body.get("userId", "user123"),
+                          "title": body.get("title", "Untitled Task"),
+                          "description": body.get("description", ""),
+                          "priority": body.get("priority", "medium"),
+                          "dueDate": body.get("dueDate", ""),
+                          "status": body.get("status", "pending"),
+                          "createdAt": datetime.now(timezone.utc).isoformat(),
+                      }
+                      table.put_item(Item=item)
+                      return response(201, item)
+
+                  if method == "PUT" and path == "/tasks/{id}":
+                      task_id = (event.get("pathParameters") or {}).get("id")
+                      body = json.loads(event.get("body") or "{}")
+                      updates = []
+                      values = {}
+                      names = {}
+                      for field in ["title", "description", "priority", "dueDate", "status"]:
+                          if field in body:
+                              updates.append(f"#{field} = :{field}")
+                              names[f"#{field}"] = field
+                              values[f":{field}"] = body[field]
+                      if not updates:
+                          return response(400, {"message": "No valid fields to update"})
+                      result = table.update_item(
+                          Key={"taskId": task_id},
+                          UpdateExpression="SET " + ", ".join(updates),
+                          ExpressionAttributeNames=names,
+                          ExpressionAttributeValues=values,
+                          ReturnValues="ALL_NEW",
+                      )
+                      return response(200, result.get("Attributes", {}))
+
+                  if method == "DELETE" and path == "/tasks/{id}":
+                      task_id = (event.get("pathParameters") or {}).get("id")
+                      table.delete_item(Key={"taskId": task_id})
+                      return response(200, {"message": f"Task {task_id} deleted"})
+
+                  return response(404, {"message": "Not Found"})
+              except Exception as exc:
+                  print(str(exc))
+                  return response(500, {"message": "Internal Server Error", "error": str(exc)})
+      Tags:
+        - Key: Name
+          Value: TaskApiFunction
+
+  TaskApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ZeroCostSecureServerlessTaskManagerApi
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  TasksResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TaskApi
+      ParentId: !GetAtt TaskApi.RootResourceId
+      PathPart: tasks
+
+  TaskByIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TaskApi
+      ParentId: !Ref TasksResource
+      PathPart: '{id}'
+
+  GetTasksMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TaskApi
+      ResourceId: !Ref TasksResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TaskApiFunction.Arn}/invocations'
+
+  PostTasksMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TaskApi
+      ResourceId: !Ref TasksResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TaskApiFunction.Arn}/invocations'
+
+  PutTaskMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TaskApi
+      ResourceId: !Ref TaskByIdResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TaskApiFunction.Arn}/invocations'
+
+  DeleteTaskMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TaskApi
+      ResourceId: !Ref TaskByIdResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TaskApiFunction.Arn}/invocations'
+
+  TasksOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TaskApi
+      ResourceId: !Ref TasksResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${FrontendDistribution.DomainName}'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,GET,POST,PUT,DELETE'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+  TaskByIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TaskApi
+      ResourceId: !Ref TaskByIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${FrontendDistribution.DomainName}'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,GET,POST,PUT,DELETE'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+  TaskApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TaskApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${TaskApi}/*/*'
+
+  TaskApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GetTasksMethod
+      - PostTasksMethod
+      - PutTaskMethod
+      - DeleteTaskMethod
+      - TasksOptionsMethod
+      - TaskByIdOptionsMethod
+    Properties:
+      RestApiId: !Ref TaskApi
+      Description: Initial deployment
+
+  TaskApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref TaskApi
+      DeploymentId: !Ref TaskApiDeployment
+      StageName: prod
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref BudgetAlertEmail
+
+  AlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref AlertsTopic
+          - Sid: AllowBudgetsPublish
+            Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref AlertsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:budgets::${AWS::AccountId}:*'
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Lambda-Error-Alarm
+      AlarmDescription: Lambda error count > 0 in 5 minutes
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TaskApiFunction
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: API-5xx-Alarm
+      AlarmDescription: API Gateway 5XX > 0 in 5 minutes
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref TaskApi
+        - Name: Stage
+          Value: !Ref TaskApiStage
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: ZeroCostSecureServerlessMonthlyBudget
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref BudgetAmountUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref AlertsTopic
+
+Outputs:
+  CloudFrontDomainName:
+    Description: CloudFront frontend domain
+    Value: !GetAtt FrontendDistribution.DomainName
+
+  FrontendBucketName:
+    Description: Private frontend bucket name
+    Value: !Ref FrontendBucket
+
+  ApiInvokeUrl:
+    Description: API Gateway invoke URL
+    Value: !Sub 'https://${TaskApi}.execute-api.${AWS::Region}.amazonaws.com/${TaskApiStage}'
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref AppVpc
+
+  PrivateRouteTableId:
+    Description: Private route table ID associated with the DynamoDB gateway endpoint
+    Value: !Ref PrivateRouteTable
+
+  DynamoDbGatewayVpcEndpointId:
+    Description: DynamoDB Gateway VPC endpoint ID
+    Value: !Ref DynamoDbGatewayEndpoint
+
+  LambdaSecurityGroupId:
+    Description: Lambda security group ID
+    Value: !Ref LambdaSecurityGroup

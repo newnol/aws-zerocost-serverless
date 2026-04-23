@@ -1,0 +1,71 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv*/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.pdf
+*.bbl
+*.blg
+*.lof
+*.lot
+
+# Zip artifacts (re-generate locally)
+*.zip
+
+# Terraform state (contains sensitive resource IDs — never commit)
+terraform.tfstate
+terraform.tfstate.backup
+
+# AWS Icon Package (too large, can be downloaded separately)
+Icon-package_*/
+
+# Submission package (can be regenerated)
+PROJECT2_SUBMISSION/
+
+# Large evidence files (keep in repo but could be in LFS)
+# evidence/
+
+# Keep important PDFs
+!PROJECT2_EN.pdf

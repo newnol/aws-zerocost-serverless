@@ -1,0 +1,80 @@
+\documentclass[12pt]{article}
+
+\usepackage{hcmus-report-template}
+
+% Disable indentation on new paragraphs
+\setlength{\parindent}{0pt}
+
+% Line spacing 1.5
+\renewcommand{\baselinestretch}{1.5}
+
+% Optional: graphic path
+% \graphicspath{PATH_TO_GRAPHIC_FOLDER}
+
+% To use Times font family, uncomment this row
+% \usepackage{mathptmx}
+
+% To use roman section / subsection, uncomment these rows
+% \renewcommand{\thesection}{\Roman{section}}
+% \renewcommand{\thesubsection}{\thesection.\Roman{subsection}}
+
+% Define course name, report name and report title.
+\newcommand{\coursename}{CSC11006 - Nhập môn Điện toán đám mây}
+\newcommand{\reportname}{Xây dựng ứng dụng web Serverless với kiến trúc Zero-Cost \& Secure}
+\newcommand{\reporttitle}{PROJECT 2}
+
+\newcommand{\studentname}{Ngô Tấn Tài (23127470) \\
+Nguyễn Vũ Minh Quang (23127463) \\
+Sinh viên B (MSSV) \\
+Sinh viên C (MSSV)}
+\newcommand{\teachername}{Giảng viên hướng dẫn}
+
+% Header
+\lhead{\reporttitle}
+\rhead{
+Trường Đại học Khoa học Tự nhiên - ĐHQG HCM\\
+\coursename
+}
+
+% Footer
+% \newcommand{\leftfooter}{\LaTeX\ by \href{https://github.com/trhgquan}{Quan, Tran Hoang}}
+% \lfoot{\leftfooter}
+
+% ============ DOCUMENT ============
+\begin{document}
+
+\pagenumbering{roman}
+\input{content/title.tex}
+
+\tableofcontents
+\pagebreak
+\listoftables
+\pagebreak
+\listoffigures
+\pagebreak
+
+\pagenumbering{arabic}
+\setcounter{page}{1}
+
+\input{content/introduction}
+\input{content/architecture}
+\input{content/implementation}
+\input{content/security}
+\input{content/monitoring}
+% \input{content/section}
+% \input{content/hinhanh}
+% \input{content/bangbieu}
+% \input{content/congthuctoan}
+% \input{content/thuattoan}
+% \input{content/code}
+% \input{content/ngonngu}
+% \input{content/cite}
+
+% References
+\input{ref/ref.tex}
+
+% Appendix
+% Add \cleardoublepage to move appendices to next page.
+\cleardoublepage
+\input{appendix/ex1}
+\end{document}

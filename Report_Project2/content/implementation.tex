@@ -1,0 +1,317 @@
+\section{Triển khai hệ thống}
+\label{sec:implementation}
+
+\subsection{Frontend Layer}
+\label{ssec:frontend_impl}
+
+\subsubsection{Phát triển giao diện người dùng}
+
+Frontend được xây dựng bằng HTML, CSS và JavaScript thuần, không sử dụng framework phức tạp để đảm bảo đơn giản và dễ triển khai. Giao diện cung cấp đầy đủ các chức năng CRUD cho quản lý công việc:
+
+\begin{itemize}
+    \item \textbf{Tạo task mới:} Form nhập liệu với các trường: title, description, priority (low/medium/high), dueDate, status (pending/done).
+    \item \textbf{Hiển thị danh sách tasks:} Table responsive hiển thị tất cả tasks với khả năng sắp xếp.
+    \item \textbf{Cập nhật task:} Click vào task để chỉnh sửa thông tin.
+    \item \textbf{Xóa task:} Nút delete với confirmation dialog.
+    \item \textbf{Lọc tasks:} Filter theo priority và dueDate.
+\end{itemize}
+
+Frontend gọi API thông qua JavaScript Fetch API, gửi request đến API Gateway endpoint.
+
+\subsubsection{Triển khai S3 và CloudFront}
+
+\textbf{Bước 1: Tạo S3 Bucket}
+
+\begin{itemize}
+    \item Tạo S3 bucket với tên unique (ví dụ: task-manager-frontend-2024).
+    \item \textbf{QUAN TRỌNG:} Bật tất cả 4 Block Public Access options:
+    \begin{itemize}
+        \item Block all public access
+        \item Block public access to buckets and objects granted through new access control lists (ACLs)
+        \item Block public access to buckets and objects granted through any access control lists (ACLs)
+        \item Block public access to buckets and objects granted through new public bucket or access point policies
+    \end{itemize}
+    \item \textbf{KHÔNG} bật Static Website Hosting.
+    \item Upload các file HTML, CSS, JS vào bucket.
+\end{itemize}
+
+\textbf{Bước 2: Tạo CloudFront Distribution}
+
+\begin{itemize}
+    \item Origin domain: Chọn S3 bucket vừa tạo.
+    \item \textbf{Origin Access:} Chọn "Origin access control settings (recommended)".
+    \item Tạo OAC mới với tên mô tả rõ ràng (ví dụ: task-manager-oac).
+    \item Default root object: index.html
+    \item Viewer protocol policy: Redirect HTTP to HTTPS.
+    \item Allowed HTTP methods: GET, HEAD, OPTIONS.
+    \item Cache policy: CachingOptimized.
+\end{itemize}
+
+\textbf{Bước 3: Cập nhật S3 Bucket Policy}
+
+Sau khi tạo CloudFront distribution, AWS sẽ đề xuất bucket policy. Copy và apply policy này vào S3 bucket:
+
+\begin{verbatim}
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudFrontServicePrincipal",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudfront.amazonaws.com"
+      },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::bucket-name/*",
+      "Condition": {
+        "StringEquals": {
+          "AWS:SourceArn": "arn:aws:cloudfront::account-id:distribution/distribution-id"
+        }
+      }
+    }
+  ]
+}
+\end{verbatim}
+
+Policy này đảm bảo chỉ CloudFront distribution cụ thể mới có thể đọc objects từ S3.
+
+\subsection{Backend API Layer}
+\label{ssec:backend_impl}
+
+\subsubsection{Lambda Function Implementation}
+
+Lambda function được viết bằng Python 3.12, xử lý tất cả 4 operations CRUD:
+
+\begin{itemize}
+    \item \textbf{GET /tasks:} Query tất cả tasks của user từ DynamoDB sử dụng GSI userId-index.
+    \item \textbf{POST /tasks:} Tạo task mới với taskId = UUID, lưu vào DynamoDB.
+    \item \textbf{PUT /tasks/\{id\}:} Update task theo taskId.
+    \item \textbf{DELETE /tasks/\{id\}:} Xóa task theo taskId.
+\end{itemize}
+
+Code structure:
+
+\begin{verbatim}
+def lambda_handler(event, context):
+    http_method = event['httpMethod']
+    path = event['path']
+    
+    if http_method == 'GET' and path == '/tasks':
+        return get_tasks(event)
+    elif http_method == 'POST' and path == '/tasks':
+        return create_task(event)
+    elif http_method == 'PUT':
+        return update_task(event)
+    elif http_method == 'DELETE':
+        return delete_task(event)
+\end{verbatim}
+
+\subsubsection{API Gateway Configuration}
+
+\begin{itemize}
+    \item \textbf{API Type:} REST API (không dùng HTTP API).
+    \item \textbf{Resources:} Tạo resource /tasks và /tasks/\{id\}.
+    \item \textbf{Methods:} GET, POST, PUT, DELETE với Lambda integration.
+    \item \textbf{CORS Configuration:}
+    \begin{itemize}
+        \item Access-Control-Allow-Origin: https://d1234567.cloudfront.net (CloudFront domain cụ thể)
+        \item Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
+        \item Access-Control-Allow-Headers: Content-Type
+    \end{itemize}
+    \item \textbf{Throttling Settings:}
+    \begin{itemize}
+        \item Rate limit: 100 requests/second
+        \item Burst limit: 50 requests
+    \end{itemize}
+    \item \textbf{Deployment Stage:} prod
+\end{itemize}
+
+\subsection{Network Layer}
+\label{ssec:network_impl}
+
+\subsubsection{VPC Configuration}
+
+\textbf{Bước 1: Tạo Custom VPC}
+
+\begin{itemize}
+    \item VPC CIDR: 10.0.0.0/16
+    \item Enable DNS hostnames: Yes
+    \item Enable DNS resolution: Yes
+\end{itemize}
+
+\textbf{Bước 2: Tạo Private Subnets}
+
+\begin{itemize}
+    \item \textbf{Private Subnet A:}
+    \begin{itemize}
+        \item CIDR: 10.0.1.0/24
+        \item Availability Zone: ap-southeast-1a
+        \item Auto-assign public IPv4: No
+    \end{itemize}
+    \item \textbf{Private Subnet B:}
+    \begin{itemize}
+        \item CIDR: 10.0.2.0/24
+        \item Availability Zone: ap-southeast-1b
+        \item Auto-assign public IPv4: No
+    \end{itemize}
+\end{itemize}
+
+\textbf{Bước 3: Tạo Route Table}
+
+\begin{itemize}
+    \item Tạo Private Route Table.
+    \item Associate với cả 2 Private Subnets.
+    \item \textbf{KHÔNG} tạo Internet Gateway.
+    \item \textbf{KHÔNG} tạo NAT Gateway.
+\end{itemize}
+
+\subsubsection{VPC Gateway Endpoint for DynamoDB}
+
+\textbf{Bước 1: Tạo VPC Endpoint}
+
+\begin{itemize}
+    \item Service category: AWS services
+    \item Service name: com.amazonaws.ap-southeast-1.dynamodb
+    \item VPC: Chọn Custom VPC vừa tạo
+    \item Route tables: Chọn Private Route Table
+    \item Policy: Full access (hoặc custom policy nếu cần)
+\end{itemize}
+
+Sau khi tạo, VPC Endpoint sẽ tự động thêm route vào Route Table:
+\begin{itemize}
+    \item Destination: pl-xxxxx (DynamoDB Prefix List)
+    \item Target: vpce-xxxxx (VPC Endpoint ID)
+\end{itemize}
+
+\textbf{Bước 2: Tạo Security Group cho Lambda}
+
+\begin{itemize}
+    \item Name: lambda-sg
+    \item VPC: Custom VPC
+    \item \textbf{Inbound rules:} Không cần (Lambda không nhận inbound traffic)
+    \item \textbf{Outbound rules:}
+    \begin{itemize}
+        \item Type: HTTPS
+        \item Protocol: TCP
+        \item Port: 443
+        \item Destination: pl-xxxxx (DynamoDB Prefix List)
+    \end{itemize}
+\end{itemize}
+
+\textbf{Bước 3: Attach Lambda to VPC}
+
+Trong Lambda configuration:
+\begin{itemize}
+    \item VPC: Chọn Custom VPC
+    \item Subnets: Chọn cả Private Subnet A và Private Subnet B
+    \item Security groups: Chọn lambda-sg
+\end{itemize}
+
+Khi Lambda được attach vào VPC, AWS sẽ tạo Elastic Network Interface (ENI) trong các subnets. Quá trình này mất khoảng 1-2 phút.
+
+\subsection{Database Layer}
+\label{ssec:database_impl}
+
+\subsubsection{DynamoDB Table Creation}
+
+\begin{itemize}
+    \item \textbf{Table name:} Tasks
+    \item \textbf{Partition key:} taskId (String)
+    \item \textbf{Table settings:} On-demand capacity mode
+    \item \textbf{Encryption:} AWS owned key (default, miễn phí)
+\end{itemize}
+
+\subsubsection{Global Secondary Index (GSI)}
+
+Để query tasks theo userId hiệu quả, tạo GSI:
+
+\begin{itemize}
+    \item \textbf{Index name:} userId-index
+    \item \textbf{Partition key:} userId (String)
+    \item \textbf{Sort key:} createdAt (String) - optional, để sắp xếp theo thời gian
+    \item \textbf{Projection type:} ALL (project tất cả attributes)
+\end{itemize}
+
+Với GSI này, Lambda có thể query nhanh chóng:
+\begin{verbatim}
+response = dynamodb.query(
+    TableName='Tasks',
+    IndexName='userId-index',
+    KeyConditionExpression='userId = :uid',
+    ExpressionAttributeValues={':uid': user_id}
+)
+\end{verbatim}
+
+\subsection{IAM Security Layer}
+\label{ssec:iam_impl}
+
+\subsubsection{Lambda Task Role}
+
+Tạo IAM Role cho Lambda function xử lý tasks:
+
+\textbf{Trust Policy:}
+\begin{verbatim}
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"Service": "lambda.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+\end{verbatim}
+
+\textbf{Permissions Policy (Inline):}
+\begin{verbatim}
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:Query",
+        "dynamodb:Scan"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:ap-southeast-1:123456789012:table/Tasks",
+        "arn:aws:dynamodb:ap-southeast-1:123456789012:table/Tasks/index/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/lambda/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkInterface",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DeleteNetworkInterface"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+\end{verbatim}
+
+\textbf{Giải thích các permissions:}
+\begin{itemize}
+    \item \textbf{DynamoDB actions:} Chỉ cấp quyền trên table Tasks cụ thể, không dùng wildcard.
+    \item \textbf{CloudWatch Logs:} Để Lambda ghi logs.
+    \item \textbf{EC2 Network Interface:} Bắt buộc khi Lambda chạy trong VPC để tạo ENI.
+\end{itemize}
+
+\subsubsection{Lambda Base Role}
+
+Nếu có Lambda functions khác không cần truy cập DynamoDB, tạo role riêng chỉ với CloudWatch Logs và EC2 ENI permissions.
