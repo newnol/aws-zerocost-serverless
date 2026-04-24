@@ -1,0 +1,47 @@
+language: python
+python:
+  - "3.11"
+
+branches:
+  only:
+    - main
+
+env:
+  global:
+    - AWS_DEFAULT_REGION=$AWS_REGION
+
+jobs:
+  include:
+    - stage: test
+      name: "Test Backend"
+      install:
+        - cd backend
+        - pip install boto3 moto pytest
+      script:
+        - python -m pytest test_lambda.py -v
+
+    - stage: deploy
+      name: "Deploy Backend to Lambda"
+      if: branch = main AND type = push
+      install:
+        - pip install awscli
+      script:
+        - cd backend
+        - zip -r function.zip lambda_function.py
+        - aws lambda update-function-code --function-name $LAMBDA_FUNCTION_NAME --zip-file fileb://function.zip
+        - aws lambda wait function-updated --function-name $LAMBDA_FUNCTION_NAME
+
+    - stage: deploy
+      name: "Deploy Frontend to S3"
+      if: branch = main AND type = push
+      install:
+        - pip install awscli
+      script:
+        - cd frontend
+        - aws s3 sync . s3://$S3_BUCKET_NAME/ --exclude "README.md" --delete
+        - aws cloudfront create-invalidation --distribution-id $CLOUDFRONT_DISTRIBUTION_ID --paths "/*"
+
+notifications:
+  email:
+    on_success: change
+    on_failure: always
